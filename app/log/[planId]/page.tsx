@@ -2,6 +2,7 @@ import { notFound } from 'next/navigation';
 import { getPlan, getLastLoggedWeights, getLastSessionSets } from '@/lib/plans';
 import { BASELINE_BY_ID, getExercise } from '@/lib/baseline';
 import { evaluateProgression, computeNextWeight } from '@/lib/engine';
+import { getLadder } from '@/lib/ladders';
 import LogWorkoutClient, {
   type ExerciseInfo,
   type EngineSuggestion,
@@ -61,7 +62,7 @@ export default async function LogWorkoutPage({
     let suggestedKg: number | null = null;
     if (progression.decision === 'progress') {
       const currentWeightKg = Math.max(...sets.map((s) => s.weightKg));
-      const next = computeNextWeight(ex, currentWeightKg);
+      const next = computeNextWeight(ex, currentWeightKg, getLadder(ex));
       if (next.status === 'ok') suggestedKg = next.weightKg;
     }
 
