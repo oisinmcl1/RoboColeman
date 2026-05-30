@@ -58,3 +58,4 @@ Thumbs.db
 # Misc
 .envrc
 *.local
+/lib/generated/prisma
