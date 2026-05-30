@@ -17,6 +17,34 @@ model Workout {
   date    DateTime  @default(now())
   note    String?
   setLogs SetLog[]
+  // Optional: a Workout may be performed against a Plan. Deleting the Plan
+  // sets this to null rather than deleting the logged Workout (see SetNull).
+  planId  String?
+  plan    Plan?     @relation(fields: [planId], references: [id], onDelete: SetNull)
+}
+
+model Plan {
+  id        String     @id @default(cuid())
+  name      String
+  note      String?
+  createdAt DateTime   @default(now())
+  items     PlanItem[]
+  workouts  Workout[]
+}
+
+model PlanItem {
+  id            String  @id @default(cuid())
+  planId        String
+  plan          Plan    @relation(fields: [planId], references: [id], onDelete: Cascade)
+  // String key into the in-code BASELINE catalog (e.g. 'squat'), not a DB relation.
+  exerciseId    String
+  order         Int
+  targetSets    Int?
+  targetRepMin  Int?
+  targetRepMax  Int?
+  targetWeightKg Float?
+
+  @@index([planId])
 }
 
 model SetLog {
