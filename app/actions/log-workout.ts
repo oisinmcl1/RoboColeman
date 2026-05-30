@@ -15,6 +15,9 @@ export type WorkoutExerciseInput = {
 
 export type SaveWorkoutInput = {
   note?: string;
+  // Optional link back to the Plan this workout was performed against. When set,
+  // it populates Workout.planId; deleting the Plan later nulls it (schema SetNull).
+  planId?: string;
   exercises: WorkoutExerciseInput[];
 };
 
@@ -37,6 +40,7 @@ export async function saveWorkout(input: SaveWorkoutInput): Promise<string> {
   const workout = await prisma.workout.create({
     data: {
       note: input.note,
+      planId: input.planId,
       setLogs: {
         create: setLogs,
       },
