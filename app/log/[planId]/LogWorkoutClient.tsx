@@ -6,6 +6,29 @@ import { saveWorkout, type SaveWorkoutInput } from '@/app/actions/log-workout';
 // Display info the server looked up from the in-code BASELINE catalog.
 export type ExerciseInfo = { name: string; baselineKg: number };
 
+// The progression engine's verdict for one exercise, computed on the server.
+// `decision`/`reason` mirror the engine's ProgressionResult; `suggestedKg` is
+// the resolved next weight, present only when the engine both decided to
+// progress AND could compute a concrete weight (null for needs-ladder /
+// at-ceiling, so the UI falls back to the last weight).
+export type EngineSuggestion = {
+  decision: 'progress' | 'hold';
+  reason: 'all-sets-at-top' | 'reps-below-top' | 'missed-or-unlogged';
+  suggestedKg: number | null;
+};
+
+// One line of plain-language guidance from the engine's verdict.
+function suggestionLine(s: EngineSuggestion): string {
+  if (s.decision === 'progress') {
+    return s.suggestedKg != null
+      ? 'All sets hit the top of the rep range last time — weight bumped up.'
+      : 'All sets hit the top of the rep range — pick the next weight up.';
+  }
+  return s.reason === 'reps-below-top'
+    ? 'Some sets were below the rep target last time — holding this weight.'
+    : 'Last session wasn’t fully logged — holding this weight.';
+}
+
 // Just the fields of the plan the client touches. Defined structurally so this
 // Client Component never imports the server-only @/lib/plans module.
 type PlanItem = {
@@ -24,6 +47,7 @@ type Props = {
   plan: Plan;
   lastWeights: Record<string, number>;
   exerciseInfo: Record<string, ExerciseInfo>;
+  suggestions: Record<string, EngineSuggestion>;
 };
 
 // One editable set. Numbers are held as strings so inputs can be cleared.
@@ -47,11 +71,18 @@ function initSession(
   plan: Plan,
   lastWeights: Record<string, number>,
   exerciseInfo: Record<string, ExerciseInfo>,
+  suggestions: Record<string, EngineSuggestion>,
 ): SessionExercise[] {
   return plan.items.map((item) => {
     const count = item.targetSets ?? DEFAULT_SETS;
-    // Last logged weight wins; fall back to the baseline seed when no history.
-    const seed = lastWeights[item.exerciseId] ?? exerciseInfo[item.exerciseId]?.baselineKg ?? 0;
+    // A valid engine suggestion (progress + a computed weight) wins; otherwise
+    // the last logged weight; otherwise the baseline seed when there's no
+    // history. needs-ladder / at-ceiling leave suggestedKg null and so fall
+    // through to the last weight here.
+    const suggestion = suggestions[item.exerciseId];
+    const suggested = suggestion?.decision === 'progress' ? suggestion.suggestedKg : null;
+    const seed =
+      suggested ?? lastWeights[item.exerciseId] ?? exerciseInfo[item.exerciseId]?.baselineKg ?? 0;
     const weightStr = String(seed);
     return {
       exerciseId: item.exerciseId,
@@ -60,11 +91,16 @@ function initSession(
   });
 }
 
-export default function LogWorkoutClient({ plan, lastWeights, exerciseInfo }: Props) {
+export default function LogWorkoutClient({
+  plan,
+  lastWeights,
+  exerciseInfo,
+  suggestions,
+}: Props) {
   // Lazy initialiser runs once: the plan is copied into local state and never
   // read again, so the stored plan is untouched by anything below.
   const [session, setSession] = useState<SessionExercise[]>(() =>
-    initSession(plan, lastWeights, exerciseInfo),
+    initSession(plan, lastWeights, exerciseInfo, suggestions),
   );
   const [saving, setSaving] = useState(false);
   const [savedId, setSavedId] = useState<string | null>(null);
@@ -158,9 +194,24 @@ export default function LogWorkoutClient({ plan, lastWeights, exerciseInfo }: Pr
       )}
 
       <div className="space-y-4">
-        {session.map((ex, exIndex) => (
+        {session.map((ex, exIndex) => {
+          const last = lastWeights[ex.exerciseId];
+          const suggestion = suggestions[ex.exerciseId];
+          const hasSuggestion =
+            suggestion?.decision === 'progress' && suggestion.suggestedKg != null;
+          return (
           <div key={ex.exerciseId} className="space-y-2 rounded border border-gray-200 p-3">
             <h2 className="font-medium">{exerciseInfo[ex.exerciseId]?.name ?? ex.exerciseId}</h2>
+
+            <div className="space-y-0.5 text-xs text-gray-600">
+              {last != null && <p>Last: {last} kg</p>}
+              {hasSuggestion && (
+                <p className="font-medium text-green-700">
+                  Suggested: {suggestion.suggestedKg} kg
+                </p>
+              )}
+              {suggestion && <p>{suggestionLine(suggestion)}</p>}
+            </div>
 
             <div className="space-y-2">
               {ex.sets.map((set, setIndex) => (
@@ -206,7 +257,8 @@ export default function LogWorkoutClient({ plan, lastWeights, exerciseInfo }: Pr
               Add set
             </button>
           </div>
-        ))}
+          );
+        })}
       </div>
 
       <button
