@@ -1,41 +1,60 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# Node modules
+/node_modules/
 
-# dependencies
-/node_modules
-/.pnp
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
-
-# testing
-/coverage
-
-# next.js
+# Next.js build output and cache
 /.next/
+/.next/cache/
 /out/
+/dist/
+/build/
+/.vercel/
+/.vercel/output/
 
-# production
-/build
+# Local env files (keep !/.env.example if you store a sample)
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+.env.*.local
+!.env.example
 
-# misc
-.DS_Store
-*.pem
-
-# debug
+# Logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-.pnpm-debug.log*
+pnpm-debug.log*
+logs/
+*.log
 
-# env files (can opt-in for committing if needed)
-.env*
-
-# vercel
-.vercel
-
-# typescript
+# TypeScript
 *.tsbuildinfo
-next-env.d.ts
+
+# Test coverage and test artifacts
+/coverage/
+/.nyc_output/
+/jest-cache/
+/test-results/
+/cypress/videos/
+/cypress/screenshots/
+
+# Caches
+/.cache/
+/.cache/
+/.parcel-cache/
+/.cache/next
+/.turbo/
+
+# IDEs and editors
+/.idea/
+/*.iml
+/.vscode/
+/.history/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc
+.envrc
+*.local
