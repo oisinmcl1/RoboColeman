@@ -15,6 +15,8 @@
 
 import 'server-only';
 
+import { formatMemoriesForContext } from '@/lib/memory';
+
 /**
  * Read a required secret from the environment, throwing a clear, named error if
  * it is missing. Keeping this in one place means the credential fails the same
@@ -129,6 +131,25 @@ The CONTEXT section below contains authoritative, pre-computed facts about this 
 - Your job is to NARRATE and CELEBRATE the facts in the context in your voice. The facts come from the context; the energy comes from you.`;
 
 /**
+ * Rules for the lifter's long-term memory section.
+ *
+ * Memories are durable, qualitative facts about the *person* (injuries, goals,
+ * preferences) — not the per-question training numbers. They exist to shape
+ * Robo's awareness and tone: a noted shoulder injury should make him mindful
+ * and considerate, a stated goal should let him cheer toward it. Crucially,
+ * memory is NOT a source of training prescriptions. The hard line from
+ * {@link ROBO_CONTEXT_RULES} still governs every number: those come only from
+ * the engine's CONTEXT, and memory may never introduce, change, or override
+ * any weight, rep, set, or training decision.
+ */
+export const ROBO_MEMORY_RULES = `ABOUT THE LIFTER (long-term memory):
+The section below holds durable background facts about this person — things like injuries, goals, and preferences — remembered across conversations. They are NOT this session's training plan.
+
+- Use these facts to shape your awareness, tone, and encouragement. If a memory notes an injury, be mindful of it and supportive about it; if it notes a goal, cheer them toward it.
+- These are background colour about the person, NOT a source of training numbers. They never contain a prescription for today.
+- The number rules above still apply without exception: every weight, rep, set, and training decision comes ONLY from the engine CONTEXT below. Memory must never add, change, override, or contradict any of those numbers. If memory and the engine context ever seem to disagree about what to do today, the engine context wins — always.`;
+
+/**
  * Like {@link askRobo}, but grounds the reply in authoritative `context`.
  *
  * The same persona drives the voice, but the system message is extended with
@@ -142,13 +163,34 @@ export async function askRoboWithContext(
 ): Promise<string> {
   const apiKey = requireEnv('OPENAI_API_KEY');
 
+  // Durable background facts about the lifter (injuries, goals, preferences),
+  // loaded fresh each call. Distinct from the per-question engine `context`:
+  // memory shapes awareness and tone, never the numbers. Empty string when the
+  // lifter has no stored memories, in which case we omit the section entirely.
+  const memories = await formatMemoriesForContext();
+
+  // Two clearly-labelled, non-overlapping fact sections:
+  //   • ABOUT THE LIFTER — durable, qualitative memory (only if present).
+  //   • CONTEXT — this session's authoritative, engine-computed numbers.
+  // The rule blocks before each section spell out how Robo must treat it, and
+  // the memory rules explicitly defer to the engine context on any number.
+  const memorySection = memories
+    ? `${ROBO_MEMORY_RULES}
+
+ABOUT THE LIFTER (durable background facts — inform tone, never a source of numbers):
+${memories}
+
+`
+    : '';
+
   // Persona (how he talks) + grounding rules (how he must treat numbers) +
-  // the authoritative facts themselves, fenced off as a labelled section.
+  // optional memory (who the lifter is) + the authoritative facts themselves,
+  // fenced off as a labelled section.
   const systemContent = `${ROBO_SYSTEM_PROMPT}
 
 ${ROBO_CONTEXT_RULES}
 
-CONTEXT (authoritative facts — report exactly, never alter):
+${memorySection}CONTEXT (authoritative facts — report exactly, never alter):
 ${context}`;
 
   const response = await fetch(OPENAI_URL, {

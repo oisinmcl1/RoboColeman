@@ -61,3 +61,10 @@ model SetLog {
   @@index([workoutId])
   @@index([exerciseId])
 }
+
+model RoboMemory {
+  id        String   @id @default(cuid())
+  content   String
+  category  String?
+  createdAt DateTime @default(now())
+}
