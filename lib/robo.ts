@@ -109,3 +109,80 @@ export async function askRobo(message: string): Promise<string> {
 
   return text;
 }
+
+/**
+ * Grounding rules for context-backed replies.
+ *
+ * This is the firewall between Robo's *mouth* and the app's *brain*. The
+ * persona controls how he talks; these rules control his relationship to the
+ * numbers. They forbid him from doing any arithmetic or invention of his own:
+ * every weight, rep, and training decision must come verbatim from the
+ * supplied context, which the engine — not the model — computed. Robo is a
+ * narrator of facts here, never their author.
+ */
+export const ROBO_CONTEXT_RULES = `IMPORTANT — HOW TO USE THE CONTEXT:
+The CONTEXT section below contains authoritative, pre-computed facts about this lifter's training. Treat it as the single source of truth.
+
+- Every number in the context — weights, reps, sets, RPE, percentages, any training decision — is a FACT that has already been calculated for you. Report these numbers exactly as written.
+- You must NEVER invent, change, round, recalculate, or estimate any number. Do not do arithmetic of your own. If a number is not in the context, do not make one up — instead say you don't have it.
+- You must NEVER contradict or alter anything stated in the context. If the context says lift 100kg for 5 reps, you say 100kg for 5 reps — with maximum hype, but never a different number.
+- Your job is to NARRATE and CELEBRATE the facts in the context in your voice. The facts come from the context; the energy comes from you.`;
+
+/**
+ * Like {@link askRobo}, but grounds the reply in authoritative `context`.
+ *
+ * The same persona drives the voice, but the system message is extended with
+ * strict fact-grounding rules and a clearly-labelled CONTEXT section holding
+ * the engine-computed numbers. Robo must narrate those numbers exactly and is
+ * explicitly forbidden from inventing or recalculating any of them.
+ */
+export async function askRoboWithContext(
+  message: string,
+  context: string,
+): Promise<string> {
+  const apiKey = requireEnv('OPENAI_API_KEY');
+
+  // Persona (how he talks) + grounding rules (how he must treat numbers) +
+  // the authoritative facts themselves, fenced off as a labelled section.
+  const systemContent = `${ROBO_SYSTEM_PROMPT}
+
+${ROBO_CONTEXT_RULES}
+
+CONTEXT (authoritative facts — report exactly, never alter):
+${context}`;
+
+  const response = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages: [
+        { role: 'system', content: systemContent },
+        { role: 'user', content: message },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(
+      `OpenAI request failed: ${response.status} ${response.statusText}${
+        detail ? ` — ${detail}` : ''
+      }`,
+    );
+  }
+
+  const data = await response.json();
+
+  // OpenAI nests the answer under choices[].message.content.
+  const text: string | undefined = data?.choices?.[0]?.message?.content;
+
+  if (!text) {
+    throw new Error('OpenAI response contained no text');
+  }
+
+  return text;
+}
