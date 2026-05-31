@@ -16,6 +16,10 @@
 import 'server-only';
 
 import { formatMemoriesForContext } from '@/lib/memory';
+import { z } from 'zod';
+
+import { exerciseSchema, type Exercise } from '@/lib/exercise-schema';
+import { getExercisesFromDb } from '@/lib/exercises-db';
 
 /**
  * Read a required secret from the environment, throwing a clear, named error if
@@ -110,6 +114,321 @@ export async function askRobo(message: string): Promise<string> {
   }
 
   return text;
+}
+
+/**
+ * Instruction for proposing a brand-new exercise definition as strict JSON.
+ *
+ * This is a SHAPE contract, not a persona: it tells the model exactly which
+ * fields to emit and forbids any prose, markdown, or invented weight. The model
+ * is only allowed to describe the *movement* (its mechanics and progression
+ * style) — never how heavy it should be. The starting weight is an empirical
+ * fact discovered by the lifter's first logged set, so the model is explicitly
+ * barred from guessing it. Pairing this JSON-only instruction with a Zod
+ * safeParse on the way back gives a hard boundary: anything that isn't a valid
+ * Exercise shape is rejected rather than trusted.
+ */
+const PROPOSE_EXERCISE_INSTRUCTION = `You define strength-training exercises as strict JSON for an app. Given a movement name (and an optional hint), output a single JSON object describing that exercise.
+
+Return a JSON object with EXACTLY these fields:
+- "id": a lowercase kebab-case string derived from the name (e.g. "Incline Dumbbell Press" -> "incline-dumbbell-press"). Letters, digits, and hyphens only.
+- "name": the human-readable movement name as a string.
+- "type": one of "barbell", "dumbbell", "plate-loaded", "pin-machine".
+- "scope": one of "universal" (available in any gym) or "home-only".
+- "repRange": an object { "min": <integer>, "max": <integer> } with min <= max.
+- "increment": a discriminated-union object whose "kind" matches the type of loading. Use EXACTLY one of:
+    - { "kind": "barbell", "perSideKg": <number> }      // smallest plate added PER SIDE of the bar
+    - { "kind": "dumbbell-pair" }                          // no extra fields
+    - { "kind": "plate", "smallestPlateKg": <number> }    // smallest single plate available
+    - { "kind": "pin", "observedStepsKg": [<number>, ...] } // OPTIONAL; omit it entirely if unknown — do NOT invent values
+  Choose the "kind" that fits the loading mechanism (typically: barbell->barbell, dumbbell->dumbbell-pair, plate-loaded->plate, pin-machine->pin).
+- "unit": one of "total", "per-side", "per-hand", "stack" — how the logged weight is expressed for this movement.
+- "notes": OPTIONAL short string; omit it if you have nothing useful to add.
+
+CRITICAL RULES:
+- Do NOT include a working weight, baselineKg, current weight, or any starting load. The weight is determined later from the lifter's first logged set — NOT by you. Never invent or guess it.
+- Return ONLY the raw JSON object. No prose, no explanation, no markdown, no code fences. The first character of your reply must be "{" and the last must be "}".`;
+
+/**
+ * Ask the model to propose a brand-new {@link Exercise} definition as JSON.
+ *
+ * Unlike the chat functions above, this call has nothing to do with the Robo
+ * persona — it uses the same provider seam (the OpenAI Chat Completions
+ * endpoint) purely as a structured-output generator. The model proposes the
+ * exercise's *shape and progression style*; it is explicitly forbidden from
+ * inventing the working weight, which is discovered later from logging.
+ *
+ * Reliability comes from two cooperating halves:
+ *   1. The instruction demands JSON-only output (no prose/markdown).
+ *   2. The reply is run through `exerciseSchema.safeParse`, so a wrong shape is
+ *      rejected with a formatted error instead of flowing downstream.
+ *
+ * Returns a discriminated result: `{ ok: true, exercise }` on success, or
+ * `{ ok: false, error }` when parsing or validation fails.
+ */
+export async function proposeExercise(
+  name: string,
+  hint?: string,
+): Promise<
+  { ok: true; exercise: Exercise } | { ok: false; error: string }
+> {
+  const apiKey = requireEnv('OPENAI_API_KEY');
+
+  // The user turn carries only the raw inputs; all shape/contract lives in the
+  // system instruction so the model can't mistake guidance for data.
+  const userContent = hint
+    ? `Movement name: ${name}\nHint: ${hint}`
+    : `Movement name: ${name}`;
+
+  const response = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages: [
+        { role: 'system', content: PROPOSE_EXERCISE_INSTRUCTION },
+        { role: 'user', content: userContent },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(
+      `OpenAI request failed: ${response.status} ${response.statusText}${
+        detail ? ` — ${detail}` : ''
+      }`,
+    );
+  }
+
+  const data = await response.json();
+
+  // OpenAI nests the answer under choices[].message.content.
+  const text: string | undefined = data?.choices?.[0]?.message?.content;
+
+  if (!text) {
+    throw new Error('OpenAI response contained no text');
+  }
+
+  // First boundary: the text must actually be JSON. A model that returns prose
+  // or fenced markdown despite the instruction trips here and is rejected.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {
+      ok: false,
+      error: `Model did not return valid JSON: ${text}`,
+    };
+  }
+
+  // Second boundary: the JSON must match the Exercise shape. We validate
+  // against the schema with `baselineKg` OMITTED, because the model is
+  // explicitly forbidden from supplying a weight — validating against the full
+  // schema would require a field we told the model never to send, so a correct
+  // proposal could never pass. safeParse never throws: a bad shape comes back
+  // as a structured error we can surface.
+  const result = exerciseSchema.omit({ baselineKg: true }).safeParse(parsed);
+  if (!result.success) {
+    return {
+      ok: false,
+      // Human-readable, field-by-field account of what failed validation.
+      error: z.prettifyError(result.error),
+    };
+  }
+
+  // The full Exercise shape requires baselineKg, so we stamp in 0 as a
+  // placeholder here. The real starting weight is set later from the lifter's
+  // first logged set, never by the model.
+  return { ok: true, exercise: { ...result.data, baselineKg: 0 } };
+}
+
+/**
+ * Zod schema for a model-proposed training plan.
+ *
+ * This is a deliberately NARROW shape. Each item references an exercise by id
+ * and carries integer set/rep targets — and NOTHING else. There is no weight
+ * field anywhere, by design (see {@link ProposedPlan}): the loading is the
+ * engine's job, not the model's.
+ *
+ * Note this validates *structure only*. It can confirm `exerciseId` is a
+ * string, but it has no idea whether that string names a real exercise — that
+ * second, semantic check is done separately against the fetched catalog.
+ */
+const proposedPlanSchema = z.object({
+  name: z.string(),
+  note: z.string().optional(),
+  items: z
+    .array(
+      z.object({
+        exerciseId: z.string(),
+        targetSets: z.number().int(),
+        targetRepMin: z.number().int(),
+        targetRepMax: z.number().int(),
+      }),
+    )
+    .min(1),
+});
+
+/**
+ * A training plan proposed by the model.
+ *
+ * Note the conspicuous ABSENCE of any weight field — on the plan, on the items,
+ * anywhere. This is deliberate. The model picks the *movements* and the
+ * *set/rep targets* (the qualitative skeleton of a session); the actual load for
+ * each exercise is computed by the engine from the lifter's logged history, the
+ * exercise's increment rule, and its baseline. Letting the model emit a weight
+ * would invite invented numbers into a place the app treats as authoritative —
+ * exactly the boundary the rest of this module works to enforce.
+ */
+export type ProposedPlan = z.infer<typeof proposedPlanSchema>;
+
+/**
+ * Build the system instruction for {@link proposePlan}.
+ *
+ * The allowed-exercise list is injected as data: the model may ONLY choose from
+ * these ids, and is told so explicitly. Like {@link PROPOSE_EXERCISE_INSTRUCTION}
+ * this is a pure shape contract (JSON only, no prose) and it hard-forbids any
+ * weight — the engine, not the model, decides load.
+ */
+function buildProposePlanInstruction(exercises: Exercise[]): string {
+  // Hand the model only what it needs to choose sensibly: the id it must
+  // reference, the human name, the loading type, and the exercise's own rep
+  // range as guidance. Crucially NOT the weight/baseline — that's not its call.
+  const allowed = exercises
+    .map(
+      (e) =>
+        `- id: "${e.id}" | name: "${e.name}" | type: ${e.type} | repRange: ${e.repRange.min}-${e.repRange.max}`,
+    )
+    .join('\n');
+
+  return `You design strength-training plans as strict JSON for an app. You will be given the user's request and a fixed list of the ONLY exercises you may use.
+
+ALLOWED EXERCISES (choose exclusively from these — every item's "exerciseId" MUST be one of these ids, copied exactly):
+${allowed}
+
+Return a single JSON object with EXACTLY these fields:
+- "name": a short human-readable name for the plan, as a string.
+- "note": OPTIONAL short string with any useful context; omit it entirely if you have nothing to add.
+- "items": a non-empty array of objects, each with EXACTLY:
+    - "exerciseId": a string that is one of the allowed ids above, copied verbatim. Do NOT invent ids or use names.
+    - "targetSets": an integer number of sets.
+    - "targetRepMin": an integer, the bottom of the target rep range for that exercise.
+    - "targetRepMax": an integer, the top of the target rep range (>= targetRepMin).
+
+CRITICAL RULES:
+- Do NOT include any weight, load, kg, baselineKg, or starting weight anywhere — not on the plan, not on any item. Weights are determined SEPARATELY by the engine, never by you. Adding a weight is an error.
+- Every "exerciseId" MUST appear in the allowed list above. Never reference an exercise that is not listed.
+- Return ONLY the raw JSON object. No prose, no explanation, no markdown, no code fences. The first character of your reply must be "{" and the last must be "}".`;
+}
+
+/**
+ * Ask the model to propose a training plan, constrained to real exercises.
+ *
+ * The model is given the user's free-text `request` plus the live exercise
+ * catalog (ids, names, types, rep ranges) fetched via `getExercisesFromDb`, and
+ * told those are the only exercises it may use. It returns a {@link ProposedPlan}
+ * — movements and set/rep targets only, deliberately with NO weights (load is
+ * the engine's responsibility).
+ *
+ * Reliability comes from THREE cooperating checks:
+ *   1. The instruction demands JSON-only output (no prose/markdown).
+ *   2. `proposedPlanSchema.safeParse` rejects anything that isn't the right shape.
+ *   3. Every `exerciseId` is verified to exist in the fetched catalog — Zod can
+ *      confirm the field is a string, but not that it names a real exercise.
+ *
+ * Returns `{ ok: true, plan }` on success, or `{ ok: false, error }` if the
+ * model returns non-JSON, the wrong shape, or references an unknown exercise.
+ */
+export async function proposePlan(
+  request: string,
+): Promise<{ ok: true; plan: ProposedPlan } | { ok: false; error: string }> {
+  const apiKey = requireEnv('OPENAI_API_KEY');
+
+  // The catalog is both the menu the model chooses from and the allowlist we
+  // validate its choices against afterwards — one source for both halves.
+  const exercises = await getExercisesFromDb();
+
+  const response = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages: [
+        { role: 'system', content: buildProposePlanInstruction(exercises) },
+        { role: 'user', content: request },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(
+      `OpenAI request failed: ${response.status} ${response.statusText}${
+        detail ? ` — ${detail}` : ''
+      }`,
+    );
+  }
+
+  const data = await response.json();
+
+  // OpenAI nests the answer under choices[].message.content.
+  const text: string | undefined = data?.choices?.[0]?.message?.content;
+
+  if (!text) {
+    throw new Error('OpenAI response contained no text');
+  }
+
+  // First boundary: the reply must actually be JSON.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {
+      ok: false,
+      error: `Model did not return valid JSON: ${text}`,
+    };
+  }
+
+  // Second boundary: the JSON must match the ProposedPlan shape. safeParse
+  // never throws — a bad shape comes back as a structured error we surface.
+  const result = proposedPlanSchema.safeParse(parsed);
+  if (!result.success) {
+    return {
+      ok: false,
+      error: z.prettifyError(result.error),
+    };
+  }
+
+  // Third boundary (semantic, not structural): every referenced exerciseId must
+  // name a real exercise. Zod validated that exerciseId is a string, but a
+  // syntactically perfect plan can still cite a movement that doesn't exist —
+  // the model can hallucinate a plausible-looking id. We reject any unknown id
+  // against the catalog we just fetched.
+  const knownIds = new Set(exercises.map((e) => e.id));
+  const unknown = result.data.items
+    .map((item) => item.exerciseId)
+    .filter((id) => !knownIds.has(id));
+
+  if (unknown.length > 0) {
+    const unique = [...new Set(unknown)];
+    return {
+      ok: false,
+      error: `Plan references unknown exercise id(s): ${unique
+        .map((id) => `"${id}"`)
+        .join(', ')}. Allowed ids: ${exercises
+        .map((e) => `"${e.id}"`)
+        .join(', ')}.`,
+    };
+  }
+
+  return { ok: true, plan: result.data };
 }
 
 /**

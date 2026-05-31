@@ -62,6 +62,27 @@ model SetLog {
   @@index([exerciseId])
 }
 
+model Exercise {
+  // The stable string key from the in-code BASELINE catalog (e.g. 'squat').
+  // NOT a cuid — these ids match the baseline so engine logic and any existing
+  // exerciseId references (PlanItem, SetLog) line up.
+  id          String   @id
+  name        String
+  type        String
+  scope       String
+  repRangeMin Int
+  repRangeMax Int
+  // The increment discriminated-union object, stored whole as JSON. Its shape
+  // varies by `kind`, so a single typed column can't capture it — JSON keeps it
+  // intact and Zod re-validates it on read.
+  increment   Json
+  baselineKg  Float
+  unit        String
+  parked      Boolean  @default(false)
+  notes       String?
+  createdAt   DateTime @default(now())
+}
+
 model RoboMemory {
   id        String   @id @default(cuid())
   content   String
