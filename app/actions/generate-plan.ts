@@ -49,15 +49,42 @@ export async function generatePlan(request: string): Promise<GeneratePlanResult>
   // Stage 2 — the engine attaches every weight from history/baseline.
   const assembled = await assemblePlanWeights(proposed.plan);
 
-  // Attach display names so the review screen can label each row by name.
-  // (proposePlan already guaranteed every id exists in this same catalog.)
+  // Attach a display name to every item so the review screen can label each row.
+  // Where the name comes from depends on the item's kind:
+  //   - existing → the catalog (proposePlan guaranteed the id exists here);
+  //   - new/valid → the proposed exercise's own name;
+  //   - new/invalid (flagged) → a best-effort name from the raw value, since the
+  //     proposal didn't validate and may be malformed.
   const exercises = await getExercisesFromDb();
   const nameById = new Map(exercises.map((e) => [e.id, e.name]));
 
-  const items: GeneratedPlanItem[] = assembled.items.map((item) => ({
-    ...item,
-    exerciseName: nameById.get(item.exerciseId) ?? item.exerciseId,
-  }));
+  const items: GeneratedPlanItem[] = assembled.items.map((item) => {
+    if (item.kind === 'existing') {
+      return {
+        ...item,
+        exerciseName: nameById.get(item.exerciseId) ?? item.exerciseId,
+      };
+    }
+    if (item.state === 'pending-creation') {
+      return { ...item, exerciseName: item.exercise.name };
+    }
+    // Flagged: the exercise is `unknown` (it failed validation). Pull a name out
+    // if one happens to be there, otherwise fall back to a placeholder label.
+    return { ...item, exerciseName: flaggedName(item.exercise) };
+  });
 
   return { ok: true, plan: { ...assembled, items } };
+}
+
+/** Best-effort display name for a new movement that failed validation. */
+function flaggedName(raw: unknown): string {
+  if (
+    raw &&
+    typeof raw === 'object' &&
+    'name' in raw &&
+    typeof (raw as { name: unknown }).name === 'string'
+  ) {
+    return (raw as { name: string }).name;
+  }
+  return 'Invalid movement';
 }

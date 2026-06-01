@@ -30,21 +30,60 @@ import {
   type LoggedSet,
   type ProgressionResult,
 } from '@/lib/engine';
-import type { ProposedPlan } from '@/lib/robo';
+import type {
+  ProposedPlan,
+  ProposedExistingItem,
+  ProposedNewItem,
+} from '@/lib/robo';
 
 /**
- * A single plan item with its engine-derived weight and rationale attached.
+ * An EXISTING-exercise item with its engine-derived weight and rationale.
  *
- * It is the model's item (exerciseId + set/rep targets) intersected with the
- * engine's {@link ProgressionResult} (so `decision`/`reason` stay correlated as
- * a discriminated union) plus the resolved weight. `targetWeightKg` is `null`
- * for a brand-new movement that has never been logged and has no seed — there
- * is honestly no number to show, so we show none rather than invent one.
+ * It is the model's existing item (exerciseId + set/rep targets) intersected
+ * with the engine's {@link ProgressionResult} (so `decision`/`reason` stay
+ * correlated as a discriminated union) plus the resolved weight. `state` is
+ * `'assembled'`. `targetWeightKg` is `null` for an exercise that has never been
+ * logged and has no seed — there is honestly no number to show, so we show none
+ * rather than invent one.
  */
-export type AssembledPlanItem = ProposedPlan['items'][number] &
+export type AssembledExistingItem = ProposedExistingItem &
   ProgressionResult & {
+    state: 'assembled';
     targetWeightKg: number | null;
   };
+
+/**
+ * A VALID brand-new movement, pending creation.
+ *
+ * There is no history and no baseline to progress from, so it carries no weight:
+ * `targetWeightKg` is `null` and the `reason` explains that the load is set on
+ * the first log. No engine decision applies — the engine is never consulted.
+ */
+export type AssembledPendingNewItem = Extract<ProposedNewItem, { valid: true }> & {
+  state: 'pending-creation';
+  targetWeightKg: null;
+  reason: string;
+};
+
+/**
+ * An INVALID new-movement proposal, carried through rather than dropped.
+ *
+ * It keeps its validation `error` (from {@link ProposedNewItem}) and gets no
+ * weight. The caller can surface the problem instead of silently losing the item.
+ */
+export type AssembledFlaggedNewItem = Extract<ProposedNewItem, { valid: false }> & {
+  state: 'flagged';
+  targetWeightKg: null;
+};
+
+/**
+ * A single assembled item: a discriminated union on `state`, carrying its
+ * original `kind` plus whatever weight/rationale applies to that state.
+ */
+export type AssembledPlanItem =
+  | AssembledExistingItem
+  | AssembledPendingNewItem
+  | AssembledFlaggedNewItem;
 
 /** Robo's proposed plan with a weight (and rationale) attached to every item. */
 export type AssembledPlan = Omit<ProposedPlan, 'items'> & {
@@ -52,38 +91,68 @@ export type AssembledPlan = Omit<ProposedPlan, 'items'> & {
 };
 
 /**
- * Attach an engine-derived target weight to every item in a proposed plan.
+ * Attach the right weight + state to every item in a proposed plan.
  *
- * For each item, working purely from the exercise definition + logged history:
- *   1. `evaluateProgression` decides whether the lifter earned a bump.
- *   2. If the decision is 'progress', `computeNextWeight` resolves the next
- *      load (consulting `getLadder` for the gym-dependent dumbbell/pin kinds).
+ * Items are handled by kind:
  *
- * The resolved `targetWeightKg` follows a strict fallback chain:
- *   - the engine's suggested next weight, if it actually computed one; else
- *   - the last logged weight (we hold at what was lifted); else
- *   - the exercise's `baselineKg` seed, when there is NO logged history at all;
- *   - `null`, when even that seed is 0 (a never-logged, unseeded movement).
+ *   • EXISTING items get an engine-derived weight, exactly as before. Working
+ *     purely from the exercise definition + logged history:
+ *       1. `evaluateProgression` decides whether the lifter earned a bump.
+ *       2. If the decision is 'progress', `computeNextWeight` resolves the next
+ *          load (consulting `getLadder` for the gym-dependent dumbbell/pin kinds).
+ *     The resolved `targetWeightKg` follows a strict fallback chain:
+ *       - the engine's suggested next weight, if it actually computed one; else
+ *       - the last logged weight (we hold at what was lifted); else
+ *       - the exercise's `baselineKg` seed, when there is NO logged history;
+ *       - `null`, when even that seed is 0 (a never-logged, unseeded movement).
+ *     These are marked `state: 'assembled'`.
+ *
+ *   • VALID NEW items are `state: 'pending-creation'` with `targetWeightKg: null`.
+ *     A brand-new movement has no history and no baseline, so there is genuinely
+ *     no number to compute — the weight is discovered from the first logged set,
+ *     not invented here.
+ *
+ *   • INVALID NEW items are `state: 'flagged'` with their validation error and no
+ *     weight. They are carried through, not dropped.
  *
  * Crucially this module NEVER calls the model. Every number it attaches comes
- * from the engine and the database — never from Robo.
+ * from the engine and the database — never from Robo. New movements get `null`
+ * for the same reason: a number with no factual source is no number at all.
  */
 export async function assemblePlanWeights(
   plan: ProposedPlan,
 ): Promise<AssembledPlan> {
   // The catalog: one fetch, indexed by id for per-item lookup. This is the same
-  // source proposePlan validated against, so each id should resolve — but we
-  // fail loudly if one doesn't rather than silently dropping an item.
+  // source proposePlan validated EXISTING ids against, so each existing id
+  // should resolve — but we fail loudly if one doesn't rather than silently
+  // dropping an item.
   const exercises = await getExercisesFromDb();
   const exerciseById = new Map(exercises.map((e) => [e.id, e]));
 
-  // History for every referenced exercise in a single batched lookup (the
-  // function is designed to take many ids at once). Exercises with no usable
-  // logged history are simply absent from the map.
-  const exerciseIds = plan.items.map((item) => item.exerciseId);
-  const lastSessionByExercise = await getLastSessionSets(exerciseIds);
+  // History for the EXISTING items only, in a single batched lookup. New items
+  // reference no catalog exercise and have no history, so they are excluded.
+  // Exercises with no usable logged history are simply absent from the map.
+  const existingIds = plan.items
+    .filter((item): item is ProposedExistingItem => item.kind === 'existing')
+    .map((item) => item.exerciseId);
+  const lastSessionByExercise = await getLastSessionSets(existingIds);
 
   const items: AssembledPlanItem[] = plan.items.map((item) => {
+    if (item.kind === 'new') {
+      if (item.valid) {
+        // Pending creation: no history, no baseline, so no weight. The load is
+        // set from the lifter's first logged set — never fabricated here.
+        return {
+          ...item,
+          state: 'pending-creation',
+          targetWeightKg: null,
+          reason: 'new movement — weight set on first log',
+        };
+      }
+      // Carried through, flagged with its validation error and no weight.
+      return { ...item, state: 'flagged', targetWeightKg: null };
+    }
+
     const exercise = exerciseById.get(item.exerciseId);
     if (!exercise) {
       // proposePlan guarantees existence; reaching here means a stale plan was
@@ -101,7 +170,7 @@ export async function assemblePlanWeights(
 
     const targetWeightKg = resolveTargetWeight(exercise, sets, progression);
 
-    return { ...item, ...progression, targetWeightKg };
+    return { ...item, ...progression, state: 'assembled', targetWeightKg };
   });
 
   return { ...plan, items };

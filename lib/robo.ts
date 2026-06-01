@@ -247,31 +247,97 @@ export async function proposeExercise(
 }
 
 /**
- * Zod schema for a model-proposed training plan.
+ * Schema for a brand-new exercise proposed *inside* a plan item.
  *
- * This is a deliberately NARROW shape. Each item references an exercise by id
- * and carries integer set/rep targets — and NOTHING else. There is no weight
- * field anywhere, by design (see {@link ProposedPlan}): the loading is the
- * engine's job, not the model's.
+ * This is exactly the shape {@link proposeExercise} emits: the full Exercise
+ * definition with `baselineKg` OMITTED. The model defines the *movement* (id,
+ * type, scope, rep range, increment rule, unit, optional notes) but never its
+ * weight — the starting load is discovered from the first logged set, not the
+ * model. Reusing the same omit keeps the two new-exercise paths in lockstep.
+ */
+const newExerciseProposalSchema = exerciseSchema.omit({ baselineKg: true });
+
+/** The shape of a brand-new movement proposed within a plan (no weight). */
+export type NewExerciseProposal = z.infer<typeof newExerciseProposalSchema>;
+
+/** Integer set/rep targets carried by every plan item, regardless of kind. */
+const planTargetsShape = {
+  targetSets: z.number().int(),
+  targetRepMin: z.number().int(),
+  targetRepMax: z.number().int(),
+};
+
+/**
+ * Zod schema for the RAW plan the model emits.
  *
- * Note this validates *structure only*. It can confirm `exerciseId` is a
- * string, but it has no idea whether that string names a real exercise — that
- * second, semantic check is done separately against the fetched catalog.
+ * Each item is a discriminated union on a `kind` tag:
+ *   - "existing": references a catalog exercise by id + integer set/rep targets.
+ *   - "new": carries a full new-movement definition under `exercise` + targets.
+ *
+ * Two deliberate choices about the "new" variant:
+ *   1. `exercise` is typed `z.unknown()` here — NOT the strict exercise schema.
+ *      The new movement's *validity* is checked separately and carried through
+ *      (valid or not); a malformed proposal must never make the WHOLE plan fail
+ *      this structural gate. We only require that an `exercise` key is present.
+ *   2. As before, there is no weight field anywhere — load is the engine's job.
+ *
+ * This validates *structure only*. It can confirm an existing item's
+ * `exerciseId` is a string, but not that it names a real exercise — that
+ * semantic check is done separately against the fetched catalog.
  */
 const proposedPlanSchema = z.object({
   name: z.string(),
   note: z.string().optional(),
   items: z
     .array(
-      z.object({
-        exerciseId: z.string(),
-        targetSets: z.number().int(),
-        targetRepMin: z.number().int(),
-        targetRepMax: z.number().int(),
-      }),
+      z.discriminatedUnion('kind', [
+        z.object({
+          kind: z.literal('existing'),
+          exerciseId: z.string(),
+          ...planTargetsShape,
+        }),
+        z.object({
+          kind: z.literal('new'),
+          // Loose on purpose — see the doc comment above. Validity is assessed
+          // separately and carried through, never used to reject the plan.
+          exercise: z.unknown(),
+          ...planTargetsShape,
+        }),
+      ]),
     )
     .min(1),
 });
+
+/** Set/rep targets shared by both plan-item kinds. */
+type PlanTargets = {
+  targetSets: number;
+  targetRepMin: number;
+  targetRepMax: number;
+};
+
+/** A plan item that reuses an exercise already in the catalog. */
+export type ProposedExistingItem = PlanTargets & {
+  kind: 'existing';
+  exerciseId: string;
+};
+
+/**
+ * A plan item proposing a brand-new movement.
+ *
+ * Nested discriminant on `valid`: a proposal that passed
+ * {@link newExerciseProposalSchema} carries the parsed {@link NewExerciseProposal};
+ * one that failed carries the raw value plus the validation `error`. We keep the
+ * invalid case rather than dropping it — downstream decides what to do with it.
+ */
+export type ProposedNewItem = PlanTargets & {
+  kind: 'new';
+} & (
+    | { valid: true; exercise: NewExerciseProposal }
+    | { valid: false; exercise: unknown; error: string }
+  );
+
+/** A single proposed plan item: a discriminated union on `kind`. */
+export type ProposedPlanItem = ProposedExistingItem | ProposedNewItem;
 
 /**
  * A training plan proposed by the model.
@@ -283,8 +349,15 @@ const proposedPlanSchema = z.object({
  * exercise's increment rule, and its baseline. Letting the model emit a weight
  * would invite invented numbers into a place the app treats as authoritative —
  * exactly the boundary the rest of this module works to enforce.
+ *
+ * Each item is tagged by `kind`; new items additionally record whether their
+ * definition passed validation (see {@link ProposedNewItem}).
  */
-export type ProposedPlan = z.infer<typeof proposedPlanSchema>;
+export type ProposedPlan = {
+  name: string;
+  note?: string;
+  items: ProposedPlanItem[];
+};
 
 /**
  * Build the system instruction for {@link proposePlan}.
@@ -305,23 +378,44 @@ function buildProposePlanInstruction(exercises: Exercise[]): string {
     )
     .join('\n');
 
-  return `You design strength-training plans as strict JSON for an app. You will be given the user's request and a fixed list of the ONLY exercises you may use.
+  return `You design strength-training plans as strict JSON for an app. You will be given the user's request and a list of exercises that already exist.
 
-ALLOWED EXERCISES (choose exclusively from these — every item's "exerciseId" MUST be one of these ids, copied exactly):
+EXISTING EXERCISES (strongly PREFER these — reuse one whenever it fits the request):
 ${allowed}
 
 Return a single JSON object with EXACTLY these fields:
 - "name": a short human-readable name for the plan, as a string.
 - "note": OPTIONAL short string with any useful context; omit it entirely if you have nothing to add.
-- "items": a non-empty array of objects, each with EXACTLY:
-    - "exerciseId": a string that is one of the allowed ids above, copied verbatim. Do NOT invent ids or use names.
+- "items": a non-empty array of objects. Every item has a "kind" field that is either "existing" or "new", plus these set/rep targets:
     - "targetSets": an integer number of sets.
-    - "targetRepMin": an integer, the bottom of the target rep range for that exercise.
+    - "targetRepMin": an integer, the bottom of the target rep range.
     - "targetRepMax": an integer, the top of the target rep range (>= targetRepMin).
 
+  For an EXISTING exercise (the strongly preferred case), the item is:
+    { "kind": "existing", "exerciseId": <one of the ids above, copied verbatim>, "targetSets": ..., "targetRepMin": ..., "targetRepMax": ... }
+  Do NOT invent ids or use names — "exerciseId" MUST be one of the ids listed above.
+
+  Only if the request GENUINELY needs a movement that is NOT in the list above may you add a NEW exercise item:
+    { "kind": "new", "exercise": { <full definition, see below> }, "targetSets": ..., "targetRepMin": ..., "targetRepMax": ... }
+  The "exercise" object must have EXACTLY these fields (the same shape used to define any exercise):
+    - "id": a lowercase kebab-case string derived from the name (e.g. "Incline Dumbbell Press" -> "incline-dumbbell-press"). Letters, digits, and hyphens only.
+    - "name": the human-readable movement name as a string.
+    - "type": one of "barbell", "dumbbell", "plate-loaded", "pin-machine".
+    - "scope": one of "universal" (available in any gym) or "home-only".
+    - "repRange": an object { "min": <integer>, "max": <integer> } with min <= max.
+    - "increment": a discriminated-union object whose "kind" matches the loading. Use EXACTLY one of:
+        - { "kind": "barbell", "perSideKg": <number> }      // smallest plate added PER SIDE of the bar
+        - { "kind": "dumbbell-pair" }                          // no extra fields
+        - { "kind": "plate", "smallestPlateKg": <number> }    // smallest single plate available
+        - { "kind": "pin", "observedStepsKg": [<number>, ...] } // OPTIONAL; omit it entirely if unknown — do NOT invent values
+      Choose the "kind" that fits the loading mechanism (typically: barbell->barbell, dumbbell->dumbbell-pair, plate-loaded->plate, pin-machine->pin).
+    - "unit": one of "total", "per-side", "per-hand", "stack" — how the logged weight is expressed.
+    - "notes": OPTIONAL short string; omit it if you have nothing useful to add.
+
 CRITICAL RULES:
-- Do NOT include any weight, load, kg, baselineKg, or starting weight anywhere — not on the plan, not on any item. Weights are determined SEPARATELY by the engine, never by you. Adding a weight is an error.
-- Every "exerciseId" MUST appear in the allowed list above. Never reference an exercise that is not listed.
+- PREFER existing exercises. Add a "new" item only when no existing exercise reasonably covers what the request needs.
+- Do NOT include any weight, load, kg, baselineKg, or starting weight ANYWHERE — not on the plan, not on any item, not inside a new "exercise" object. Weights are determined SEPARATELY by the engine, never by you. Adding a weight is an error.
+- Every "existing" item's "exerciseId" MUST appear in the list above.
 - Return ONLY the raw JSON object. No prose, no explanation, no markdown, no code fences. The first character of your reply must be "{" and the last must be "}".`;
 }
 
@@ -334,14 +428,20 @@ CRITICAL RULES:
  * — movements and set/rep targets only, deliberately with NO weights (load is
  * the engine's responsibility).
  *
- * Reliability comes from THREE cooperating checks:
+ * Reliability comes from cooperating checks, but they treat the two item kinds
+ * differently:
  *   1. The instruction demands JSON-only output (no prose/markdown).
  *   2. `proposedPlanSchema.safeParse` rejects anything that isn't the right shape.
- *   3. Every `exerciseId` is verified to exist in the fetched catalog — Zod can
- *      confirm the field is a string, but not that it names a real exercise.
+ *   3. Every EXISTING item's `exerciseId` is verified to exist in the fetched
+ *      catalog — Zod can confirm it's a string, but not that it names a real
+ *      exercise. An unknown id still fails the whole plan.
+ *   4. Each NEW item's definition is validated with `newExerciseProposalSchema`,
+ *      but a failure does NOT reject the plan: the result (valid or not) is
+ *      carried through on the item so downstream can decide what to do with it.
  *
- * Returns `{ ok: true, plan }` on success, or `{ ok: false, error }` if the
- * model returns non-JSON, the wrong shape, or references an unknown exercise.
+ * Returns `{ ok: true, plan }` on success (with each item tagged by kind, and
+ * new items tagged with their validity), or `{ ok: false, error }` if the model
+ * returns non-JSON, the wrong overall shape, or an unknown existing exercise id.
  */
 export async function proposePlan(
   request: string,
@@ -406,13 +506,15 @@ export async function proposePlan(
     };
   }
 
-  // Third boundary (semantic, not structural): every referenced exerciseId must
-  // name a real exercise. Zod validated that exerciseId is a string, but a
-  // syntactically perfect plan can still cite a movement that doesn't exist —
-  // the model can hallucinate a plausible-looking id. We reject any unknown id
-  // against the catalog we just fetched.
+  // Third boundary (semantic, not structural): every EXISTING item's exerciseId
+  // must name a real exercise. Zod validated it's a string, but a syntactically
+  // perfect plan can still cite a movement that doesn't exist — the model can
+  // hallucinate a plausible-looking id. We reject any unknown id against the
+  // catalog we just fetched. NEW items are exempt: they define their own
+  // movement and are deliberately NOT in the catalog yet.
   const knownIds = new Set(exercises.map((e) => e.id));
   const unknown = result.data.items
+    .filter((item) => item.kind === 'existing')
     .map((item) => item.exerciseId)
     .filter((id) => !knownIds.has(id));
 
@@ -428,7 +530,45 @@ export async function proposePlan(
     };
   }
 
-  return { ok: true, plan: result.data };
+  // Fourth boundary (new items only): validate each proposed new movement
+  // against the exercise schema, but DO NOT reject the plan on failure. The
+  // model defines the movement without a weight, so we validate with baselineKg
+  // omitted (same as proposeExercise) and carry the verdict through on the item:
+  // valid → the parsed proposal; invalid → the raw value plus the error. A
+  // malformed new movement is handled downstream, not by failing the whole plan.
+  const items: ProposedPlanItem[] = result.data.items.map((item) => {
+    if (item.kind === 'existing') {
+      // Already the exact shape we want; pass it through untouched.
+      return item;
+    }
+
+    const parsedExercise = newExerciseProposalSchema.safeParse(item.exercise);
+    if (parsedExercise.success) {
+      return {
+        kind: 'new',
+        valid: true,
+        exercise: parsedExercise.data,
+        targetSets: item.targetSets,
+        targetRepMin: item.targetRepMin,
+        targetRepMax: item.targetRepMax,
+      };
+    }
+
+    return {
+      kind: 'new',
+      valid: false,
+      exercise: item.exercise,
+      error: z.prettifyError(parsedExercise.error),
+      targetSets: item.targetSets,
+      targetRepMin: item.targetRepMin,
+      targetRepMax: item.targetRepMax,
+    };
+  });
+
+  return {
+    ok: true,
+    plan: { name: result.data.name, note: result.data.note, items },
+  };
 }
 
 /**
